@@ -10,7 +10,7 @@
 # 1.5.9 Fixed internal log issue with the disks.info file and fixed function loop.
 # 1.5.9a Added a new option -s, Allowed to override the disk health and mark it VERIFIED_BAD
 # See more at https://github.com/kollintheprince/Rocc/
-version=1.6.0d
+version=1.6.1
 
 Usage() { # Displays how to run the tool.
   echo "
@@ -23,7 +23,11 @@ This script will find all the unmounted ss/mds/internal disks and output the fsu
                         -c (Creates a file to store the SR number for the associated disk, it will prompt for the information needed.)
                         -ar (Gives a report of the disks found on all nodes.)
                         -s (Overrides the disk health and marks the disk VERIFIED_BAD. It will prompt for the information needed.)
-            * New       -w <fsuuid> (Runs a watch on a fsuuid that will refresh every 5 seconds)
+                        -w <fsuuid> (Runs a watch on a fsuuid that will refresh every 5 seconds)
+              * New     -x <fsuuid> or <serial number> one disk / for multi  xfs_repair mode 0-9
+      
+  Example: 
+          ./show_offline_disks -x 0 or ./show_offline_disks -x 9f7f4516-16ed-4162-89ea-da1adead4aa5
 "
   exit
 }
@@ -31,7 +35,7 @@ trap control_c SIGINT
 host_name=$HOSTNAME
 disksize=$(df --block-size=1T | egrep mauiss | tail -1 |awk {'print $2'})
 black='\E[30m' #display color when outputting information
-red='\E[31m'
+red='\E[1;31m'
 green='\E[0;32m'
 yellow='\E[33m'
 blue='\E[1;34m'
@@ -53,7 +57,7 @@ pre_system_info() { # Gathering system/disk# information
   elif [[ $TotalPdisks -le 15 && $TotalPdisks -gt 0 ]]; then
     Totaldisks=15
   fi
-  ifmixed=$(ssh $rmgmaster grep dmMixDriveMode /etc/maui/maui_cfg.xml | grep -c true)
+  ifmixed=$(ssh -q $rmgmaster grep dmMixDriveMode /etc/maui/maui_cfg.xml | grep -c true)
   if [[ $ifmixed -eq 1 ]]; then
     mixed='true'
     Totaldisks=$(($TotalPdisks*2))
@@ -94,7 +98,7 @@ assign_sr() { # Assigning the SR to the fsuuid
     [123]:8)
       echo -e "Serial number detected on Gen ${hardware_gen}"
       for rmg_host in $(show_master.py | awk '/RMG/ {print $3}'); do
-        node_uuid=$(psql -U postgres rmg.db -t -h $rmg_host -c "select nodeuuid from disks where uuid='$serialnumber'"|tr -d ' '| grep -v "^$")
+        node_uuid=$(psql -U postgres rmg.db -t -h $rmg_host -c "select nodeuuid from disks where uuid='$assign_disk'"|tr -d ' '| grep -v "^$")
         [[ -n $node_uuid ]] && { host=$(psql -U postgres rmg.db -h $rmg_host -t -c "select hostname from nodes where uuid='$node_uuid'"|tr -d ' '| grep -v "^$"); }
       done
       [[ -z $node_uuid ]] && { read -p "Not able to find the host, please enter the host: " host; }
@@ -122,9 +126,9 @@ assign_sr() { # Assigning the SR to the fsuuid
   [[ $(grep -c $host /etc/hosts) -eq 0 ]] && { echo -e "The host entered is not found, ${red}${host}${white} please try again" && assign_sr && exit; }
   echo "Adding disk "$assign_disk" to SR"$sr "on host: "$host
   dir_check=$(ssh $host ls /var/service | grep -c fsuuid_SRs)
-  [[ $dir_check -ne 1 ]] && { ssh $host /bin/mkdir /var/service/fsuuid_SRs; }
-  ssh $host touch /var/service/fsuuid_SRs/${assign_disk}.txt
-  if [[ $(ssh $host grep -c $assign_disk /var/service/fsuuid_SRs/${assign_disk}.txt) -eq 1 ]]; then
+  [[ $dir_check -ne 1 ]] && { ssh -q $host /bin/mkdir /var/service/fsuuid_SRs; }
+  ssh -q $host touch /var/service/fsuuid_SRs/${assign_disk}.txt
+  if [[ $(ssh -q $host grep -c $assign_disk /var/service/fsuuid_SRs/${assign_disk}.txt) -eq 1 ]]; then
     echo -e "Fsuuid "${yellow}${assign_disk}${white}" already has an SR assigned to it"
     read -p "Are you sure you want to overwrite the previous SR? [yY] [nN]: " yousure
     [[ $yousure =~ [nN] ]] && { echo 'Exiting'; exit 16; } 
@@ -136,17 +140,19 @@ assign_sr() { # Assigning the SR to the fsuuid
 disk_health_check() { # Checking the disk health function
   if [[ $type = 'Internal' ]]; then
     if [[ $hardware_gen -lt 3 ]]; then
-      smart=$(smartctl -A $dev | egrep -i 'failing|failed' | grep -v 'WHEN_FAILED' -c)
-      reallocate=$(smartctl -A $dev |grep Reallocated_Sector_Ct | awk '{print $10}')
-      offline=$(smartctl -A $dev |awk '/Offline_Uncorrectable/ {print $10}')
+      smart_output=$(smartctl -A $dev > /var/tmp/smart_output)
+      smart=$(egrep -i 'failing|failed' /var/tmp/smart_output| grep -v 'WHEN_FAILED' -c)
+      reallocate=$(awk '/Reallocated_Sector_Ct/ {print $10}' /var/tmp/smart_output)
+      offline=$(awk '/Offline_Uncorrectable/ {print $10}' /var/tmp/smart_output)
+      current_pending=$(awk '/Current_Pending_Sector/ {print $10}' /var/tmp/smart_output); rm -f /var/tmp/smart_output
       if [[ $smart -ge 1 || -z $offline ]]; then
         diskh=$(echo -e $red"FAILED"$white)
-      elif [[ $reallocate -ge 10 || $offline -ge 10 ]]; then
+      elif [[ $reallocate -ge 10 || $offline -ge 10 || $current_pending -ge 1 ]]; then
         diskh=$(echo -e $yellow"SUSPECT"$white)
       else
         diskh=$(echo -e $green"GOOD"$white)
       fi
-      [[ $(grep -c VERIFIED_BAD /var/service/fsuuid_SRs/${disk}.info 2</dev/null) -eq 1 ]] && { diskh=$(echo -e $red"VERIFIED_BAD"$white); }
+      [[ $(grep -c VERIFIED_BAD /var/service/fsuuid_SRs/${disk}.info 2</dev/null) -ge 1 ]] && { diskh=$(echo -e $red"VERIFIED_BAD"$white); }
     fi
     if [[ $hardware_gen -eq 3 ]]; then
       diskh=$(cs_hal info $dev | grep SMART | awk '{print $3}') 1>/dev/null 2>/dev/null
@@ -157,16 +163,19 @@ disk_health_check() { # Checking the disk health function
       else
         diskh=${green}${diskh}${white}
       fi
+      [[ $(grep -c VERIFIED_BAD /var/service/fsuuid_SRs/${disk}.info 2</dev/null) -ge 1 ]] && { diskh=$(echo -e $red"VERIFIED_BAD"$white); }
     fi
   else
-    smart=$(smartctl -A $dev | egrep -i 'failing|failed' | grep -v 'WHEN_FAILED' -c)
-    reallocate=$(smartctl -A $dev |grep Reallocated_Sector_Ct | awk '{print $10}')
-    offline=$(smartctl -A $dev |awk '/Offline_Uncorrectable/ {print $10}')
+    smart_output=$(smartctl -A $dev > /var/tmp/smart_output)
+    smart=$(egrep -i 'failing|failed' /var/tmp/smart_output| grep -v 'WHEN_FAILED' -c)
+    reallocate=$(awk '/Reallocated_Sector_Ct/ {print $10}' /var/tmp/smart_output)
+    offline=$(awk '/Offline_Uncorrectable/ {print $10}' /var/tmp/smart_output)
     linedev=$(echo $dev | awk -F '/' '{print $3}')
     messagecheck=$(grep -i corruption /var/log/messages | grep -c $linedev)
+    current_pending=$(awk '/Current_Pending_Sector/ {print $10}' /var/tmp/smart_output); rm -f /var/tmp/smart_output
     if [[ $smart -ge 1 ]]; then
       diskh=$(echo -e $red"FAILED"$white)
-    elif [[ $reallocate -ge 10 || $offline -ge 10 ]]; then
+    elif [[ $reallocate -ge 10 || $offline -ge 10 || $current_pending -ge 1 ]]; then
       diskh=$(echo -e $yellow"SUSPECT"$white)
     elif [[ $messagecheck -ge 1 ]]; then
       diskh=$(echo -e $red"CORRUPTION"$white)
@@ -174,7 +183,7 @@ disk_health_check() { # Checking the disk health function
       diskh=$(echo -e $green"GOOD"$white)
     fi
     # Override the health status with the fsuuid.info file if found.
-    [[ $(grep -c VERIFIED_BAD /var/service/fsuuid_SRs/${disk}.info 2</dev/null) -eq 1 ]] && { diskh=$(echo -e $red"VERIFIED_BAD"$white); }
+    [[ $(grep -c VERIFIED_BAD /var/service/fsuuid_SRs/${disk}.info 2</dev/null) -ge 1 ]] && { diskh=$(echo -e $red"VERIFIED_BAD"$white); }
   fi
 }
 SRinput() { # How to assign an SR to an specific fsuuid or serial number
@@ -286,6 +295,7 @@ replacementdisk () {  # Checks the status of the recovery and replacement.
 }
 output_info() { # Set up for what will be outputted to the user.
   disk_health_check
+  [[ $(smartctl -i $dev|grep Serial|awk '{print $3}') != $serialnumber ]] && { dev=$(echo -e $orange'Unavailable'$white); diskh=$(echo -e $orange"Unavailable"$white); }
   if [[ -s /usr/local/xdoctor/archive/dr/history/${disk}.xml ]]; then
     start_time=$(xmllint --format /usr/local/xdoctor/archive/dr/history/${disk}.xml|grep -v True|awk -F 'statustime=\"|\" unrecoverobj=' '/statustime/{print $2}'|sort|head -1|awk -F '.' '{print $1}')
     date_diff=$(echo "$((($(date +%s)-$start_time)/86400))"); show_days=$date_diff
@@ -456,7 +466,6 @@ localrun() { # Finds the un-mounted DAE drives
           slotreplaced=$(psql -U postgres rmg.db -h $rmgmaster -t -c "select slot_replaced from disks where serialnumber='$serialnumber'" |tr -d ' ' | grep -v '^$')
           [[ $slotreplaced -eq 1 && $manslotreplaced = 'true' ]] && continue
           SRinput
-          disk_health_check
           SS_disk_counter=$(($SS_disk_counter+1))
           disk='Not Found'; type='Not Configured'
           output_info
@@ -480,7 +489,7 @@ allrun() { # Running the check on all nodes with the option of an report of what
   begin
   for x in $(/usr/local/xdoctor/pacemaker/hosts.py | awk -F '"' '{print $4}'|grep -v "^$"); # During this check there is a timeout if it is running for more than 180 seconds. It will exit out and output the troubled host taking too long
     do
-    ssh $x /var/service/show_offline_disks.sh -l >> /var/service/output.txt 2>&1 &
+    ssh -q $x /var/service/show_offline_disks.sh -l >> /var/service/output.txt 2>&1 &
   done
   count=$(ps -ef | egrep -v 'grep|bash|scp|python'| grep -c show_offline_disks)
   while [[ $count -ne 0 ]];
@@ -570,13 +579,13 @@ set_info() { # Sets the info on the disk if manual work as been done on it. It i
       set_info;exit
       ;;
   esac
-  [[ $(ssh $host grep -c Reason= /var/service/fsuuid_SRs/${set_disk}.info 2</dev/null) -ge 1 ]] && { echo -e ""; }
+  [[ $(ssh -q $host grep -c Reason= /var/service/fsuuid_SRs/${set_disk}.info 2</dev/null) -ge 1 ]] && { echo -e ""; }
   read -p "Are you sure you want to make this disk 'VERIFIED BAD'? [yY] [nN] " verify_bad
   [[ $verify_bad =~ [nN] ]] && { echo 'Exiting'; exit 6; }
   read -p "Please enter the reason why the disk is bad, short explanation: " Reason_bad
-  ssh $host touch /var/service/fsuuid_SRs/${set_disk}.info
-  ssh $host "echo Disk_health=VERIFIED_BAD, Reason=$Reason_bad >> /var/service/fsuuid_SRs/${set_disk}.info"; echo 
-  echo -e $green"All Finished;$white the disk has been set to VERIFIED_BAD with the reason of $Reason_bad."
+  ssh -q $host touch /var/service/fsuuid_SRs/${set_disk}.info
+  ssh -q $host "echo Disk_health=VERIFIED_BAD, Reason=${Reason_bad} >> /var/service/fsuuid_SRs/${set_disk}.info"; echo 
+  echo -e $green"All Finished:$white the disk has been set to VERIFIED_BAD with the reason of $Reason_bad."
 }
 watch_disk() { # Watches for changes on one disk
   [[ ! "${disk}" =~ $valid_fsuuid ]] && { echo -e "Invalid fsuuid entered, ${red}${fsuuid}${white}" && read -p "Please re-enter the fsuuid: " fsuuid && watch_disk && exit; }
@@ -599,7 +608,81 @@ watch_disk() { # Watches for changes on one disk
     echo > /var/service/local.output
   done
 }
-while getopts "hlarvcsw:" options; do
+xfs_repair_function() {
+  echo -e "This opition is currently only supported for ATT BEATLE ONLY!!!"
+  #[[ $disk = [0-9] ]] && { echo -e $cyan"multi  repair selected"$white; multi _repair; exit; }
+  tenant_id=$(psql -U postgres system.db -h $system_master -t -c "select uuid from tenants where tenantname='ATT'"|tr -d ' '| grep -v "^$")
+  disk_length=$(echo $xfs_disk |awk '{print length}')
+  run_level=$(runlevel|awk '{print $2}'); [[ $run_level -eq 5 ]] && { echo -e $red"Incorrect runlevel detected RL=$run_level, please have the node in MM. Exiting...";exit; }
+  case "${hardware_gen}:${disk_length}" in              # Checks if the disk entered is an fsuuid or serial number
+    [123]:8)
+      echo -e $white"Serial number detected on Gen ${hardware_gen}"
+      serial_number=$xfs_disk
+      fsuuid=$(psql -U postgres rmg.db -h $rmgmaster -t -c "select fsuuid from fsdisks where diskuuid='$serial_number'"|grep -v '^$'|awk '{print $1}')
+      ;;
+    [12]:15)
+        echo -e $white"Internal serial number detected on Gen ${hardware_gen}"
+        echo -e "In Devoplment... Should be in next update"; exit
+      ;;
+    [123]:36)
+      [[ ! "${xfs_disk}" =~ $valid_fsuuid ]] && { echo -e "Invalid fsuuid entered, ${red}${xfs_disk}${white}" && xfs_repair_function && exit; }
+      echo -e $white"fsuuid validation"$green "Passed"$white
+      fsuuid=$xfs_disk
+      serial_number=$(psql -U postgres rmg.db -h $rmgmaster -t -c "select diskuuid from fsdisks where fsuuid='$fsuuid'"|grep -v '^$'|awk '{print $1}')
+      ;;
+    [123]:*)
+      echo -e $white"Invalid Input, please try again."
+      xfs_repair && exit
+      ;;
+  esac
+  dev=$(awk -F "<osDevPath>|</osDevPath>" '/osDevPath/{print$2}' /var/local/maui/atmos-diskman/DISK/$serial_number/latest.xml);
+  if_mds=$(grep $fsuuid /etc/maui/mds/*/mds_cfg.xml|wc -l)
+  if [[ $if_mds -ne 0 ]]; then # Checks if the disk is an MDS associated with it
+    echo -e $white"Disk $serial_number has mds(s) associated with it... Checking db sizes."
+    mkdir /mnt/temp/; mds_mount=$(mount -t xfs ${dev}1 /mnt/temp/)
+    for mds in $(grep $fsuuid /etc/maui/mds/*/mds_cfg.xml|awk -F '/' '{print $5}');do
+      # Need to check if mounted [[ $(echo $mds_mount |awk '{print length}') -le 1 ]]
+      master=$(mauimdlsutil -q -m  '*' -n $rmgmaster |grep -B 3 $HOSTNAME:$mds|awk '/Master/{print $4}');master_host=$(echo $master |awk -F ':' '{print $1}')
+      master_port=$(echo $master|awk -F ':' '{print $2}')
+      # Check db size section
+      ls -l `mdsdir $mds` |egrep -v '__db|log' > /var/tmp/mds_${mds}_db_size; ssh -q $master_host 'ls -l `mdsdir '$master_port'`'|egrep -v '__db|log' > /var/tmp/mds_${mds}_db_size_peer
+      #Check missing files section
+      dbcheck_list="${tenant_id}_index ${tenant_id}_job ${tenant_id}_key_value ${tenant_id}_lookup ${tenant_id}_metadata ${tenant_id}_readdir ${tenant_id}_tag ${tenant_id}_version container import metric PmDb sessionStateDB tenantDb"
+      for dbcheck in $dbcheck_list;do
+        db_size=$(grep ${dbcheck} /var/tmp/mds_${mds}_db_size|awk '{print $5}')
+        db_size_peer=$(grep ${dbcheck} /var/tmp/mds_${mds}_db_size_peer|awk '{print $5}')
+        diff_percent=$(echo "scale=2; 100-$db_size*100/$db_size_peer"|bc); if_zero_diff=$(echo $diff_percent|awk -F '.' '{print $1}'); [[ -z $if_zero_diff ]] && { diff_percent=0; }
+        [[ $(echo $diff_percent|awk -F '.' '{print $1}') -lt 20 ]] && { echo -e $green"$(date):INFO: Mds below 20% File:${dbcheck}.bdbdb \n Local:${db_size} Peer:${db_size_peer} Percent:${diff_percent}%"$white; } || { echo -e $red"$(date):ERROR: Mds above 20% File:${dbcheck}.bdbdb \n Local:${db_size} Peer:${db_size_peer} Percent:${diff_percent}% ESCALETE TO ENGINEERING PER BUG 36242";error=1; }
+        [[ $(grep -c $dbcheck /var/tmp/mds_${mds}_db_size) -lt 1 ]] && { echo -e $red"ERROR Missing db file $dbcheck on $mds"$white; error=1; }
+      done
+      [[ $error -ge 1 ]] && { echo -e $red"$(date):ERROR: Failed check on missing db files or size check(see above output for details); ESCALETE TO ENGINEERING PER BUG 36242";exit; }
+      echo -e $green"All checks Passed on the MDS(s)"
+    done
+    umount /mnt/temp/
+  fi
+  read -p "Confirmed corruption on $serial_number? [yY][nN]: " -t 60 -n 1 if_xfs_checked;echo
+  [[ -z $if_xfs_checked ]] && { if_xfs_checked=y; }
+  if [[ ${if_xfs_checked} =~ [yY] ]]; then
+    echo -e "Running xfs_repair -L ${dev}1; disk $serial_number"; echo "$(date): $dev: $serial_number: $fsuuid" >> /var/tmp/${fsuuid}_xfs_repair 
+    nohup xfs_repair -L ${dev}1 >> /var/tmp/${fsuuid}_xfs_repair &
+    echo -e "Running in the background, please see the progress in /var/tmp/${fsuuid}_xfs_repair"
+  elif [[ ${if_xfs_checked} =~ [nN] ]]; then
+    echo -e "Running xfs_check on disk $serial_number"; echo "$(date): $dev: $serial_number: $fsuuid" >> /var/tmp/${fsuuid}_xfs_check
+    nohup xfs_check ${dev}1 >> /var/tmp/${fsuuid}_xfs_check &
+    echo -e "Running in the background, please see the progress in /var/tmp/${fsuuid}_xfs_check  .... Please run it again if corruption is found."
+  fi
+}
+multi_repair() { # Not ready yet
+  read -p "Please enter a list of serial numbers or fsuuid to be checked/repaired seperated by spaces: " xfs_repair_list
+  count_xfs=0
+  default_repair_num=2 # Need to assign different numbers so it can handle two at a time. 
+  for disk in $xfs_repair_list; do
+    count_xfs=$((count_xfs + 1))
+    xfs_repair $disk
+    #[[ $count -eq 2 ]] && {echo ; }
+  done
+}
+while getopts "hlarvcsw:x:" options; do
   case $options in
     l)  localrun
         exit
@@ -619,6 +702,10 @@ while getopts "hlarvcsw:" options; do
         ;;
     w)  disk=$OPTARG # Using DRAW MODE to watch a disk for replacement
         watch_disk
+        exit
+        ;;
+    x)  xfs_disk=$OPTARG
+        xfs_repair_function
         exit
         ;;
     h)  Usage
